@@ -36,12 +36,26 @@ function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-/** Kirim JSON + header signature HMAC atas raw body respons. */
-function sendSigned(res: Response, status: number, body: Record<string, unknown>): void {
+/** Kirim JSON + header signature HMAC atas raw body respons.
+ *
+ * PENTING (temuan log 2026-11-13 21:04 WIB): platform menandatangani request
+ * dengan byte UTF-8 dari string secret yang ditampilkan (kandidat ke-1),
+ * BUKAN dengan byte hasil hex/base64-decode (kandidat ke-0). Respons HARUS
+ * ditandatangani dengan kandidat yang sama dengan yang lolos verifikasi
+ * request — kalau tidak, platform menolak signature balasan dan preflight
+ * gagal dengan "body or signature was invalid" meski request-nya lolos.
+ * Karena itu sendSigned menerima secret yang sudah terverifikasi; kalau
+ * tidak diberikan, pakai kandidat pertama (perilaku lama, dipakai test). */
+function sendSigned(
+  res: Response,
+  status: number,
+  body: Record<string, unknown>,
+  secret?: Buffer
+): void {
   const raw = Buffer.from(JSON.stringify(body), "utf8");
   try {
-    const secret = hmacSecretBytes();
-    res.setHeader(SIGNATURE_HEADER, computeHmacHex(secret, raw));
+    const key = secret ?? hmacSecretBytes();
+    res.setHeader(SIGNATURE_HEADER, computeHmacHex(key, raw));
   } catch {
     // Tanpa secret (mis. mode test lokal tanpa env), kirim tanpa signature
     // tapi catat — di produksi ini TIDAK BOLEH terjadi.
@@ -109,6 +123,11 @@ export function createApp(store: SeenStore): Express {
           `panjang=${check.headerLength} encoding=${check.sigEncoding} ` +
           `kandidat-cocok=${check.secretIndex} kandidat-total=${secretCandidates.length}.`
       );
+      // Kunci untuk menandatangani SEMUA respons request ini: kandidat yang
+      // lolos verifikasi (lihat sendSigned). Untuk preflight tanpa signature,
+      // pakai kandidat terakhir (byte UTF-8 string secret) — itu kunci yang
+      // dipakai platform menurut log 21:04 WIB.
+      let responseSecret: Buffer;
       if (!check.ok) {
         // Preflight tanpa signature sama sekali: handshake saja, bukan task
         // bernilai — jawab 200 supaya health check tidak mati karena platform
@@ -117,8 +136,9 @@ export function createApp(store: SeenStore): Express {
           try {
             const peeked = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
             if (peeked.type === "agent-games.preflight.v1") {
+              responseSecret = secretCandidates[secretCandidates.length - 1];
               log("[agent] preflight TANPA signature -> jawab ok (handshake).");
-              sendSigned(res, 200, { ok: true, protocolVersion: "v1" });
+              sendSigned(res, 200, { ok: true, protocolVersion: "v1" }, responseSecret);
               return;
             }
           } catch {
@@ -129,6 +149,7 @@ export function createApp(store: SeenStore): Express {
         res.status(401).json({ error: "invalid signature" });
         return;
       }
+      responseSecret = secretCandidates[check.secretIndex];
 
       // 2. Parse JSON.
       let body: unknown;
@@ -148,7 +169,7 @@ export function createApp(store: SeenStore): Express {
       // 3. Preflight handshake (Build page, block 3).
       if (type === "agent-games.preflight.v1") {
         log("[agent] preflight -> ok.");
-        sendSigned(res, 200, { ok: true, protocolVersion: "v1" });
+        sendSigned(res, 200, { ok: true, protocolVersion: "v1" }, responseSecret);
         return;
       }
 
@@ -168,7 +189,7 @@ export function createApp(store: SeenStore): Express {
           proof_tx: "0x",
         };
         // Tidak ada task_id yang bisa diandalkan -> jangan simpan idempotency.
-        sendSigned(res, 200, responseBody as unknown as Record<string, unknown>);
+        sendSigned(res, 200, responseBody as unknown as Record<string, unknown>, responseSecret);
         return;
       }
 
@@ -176,7 +197,7 @@ export function createApp(store: SeenStore): Express {
       if (store.hasResponse(task.task_id)) {
         const previous = store.getResponse(task.task_id)!;
         log(`[agent] task ${task.task_id} sudah dijawab — kembalikan respons lama.`);
-        sendSigned(res, 200, previous as unknown as Record<string, unknown>);
+        sendSigned(res, 200, previous as unknown as Record<string, unknown>, responseSecret);
         return;
       }
 
@@ -223,7 +244,7 @@ export function createApp(store: SeenStore): Express {
       if (result.decision === "APPROVE") {
         store.markProofSeen(task.input.proof_tx);
       }
-      sendSigned(res, 200, responseBody as unknown as Record<string, unknown>);
+      sendSigned(res, 200, responseBody as unknown as Record<string, unknown>, responseSecret);
 
       // 8. Background: submit proof ke Kurier (jangan blokir respons).
       if (proof !== undefined && publicSignals !== undefined) {
