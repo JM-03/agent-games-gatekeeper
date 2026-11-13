@@ -15,6 +15,10 @@
  * 10. Kurier tanpa API key -> dilewati (skipped), bukan error.
  * 11. Replay practice task asli (practice_9e6ef3da, 2026-11-13) -> REJECT /
  *     VK_SUBSTITUTION + proof Groth16 yang lolos groth16.verify.
+ * 12. Registrasi VK Kurier saat start (tanpa jaringan, register di-mock):
+ *     key diset -> tepat 1x register-vk dengan VK hasil export + log sukses;
+ *     key kosong -> tidak ada register + log dilewati; gagal 2x lalu sukses
+ *     -> 3 percobaan; export VK asli dari .zkey -> groth16/bn128/nPublic=13.
  */
 
 import { test, before, after } from "node:test";
@@ -25,8 +29,8 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { createTestApp } from "../src/server";
 import { SeenStore } from "../src/store";
-import { verifyCircuitArtifacts, generateDecisionProof } from "../src/proof";
-import { submitProofInBackground } from "../src/kurier";
+import { verifyCircuitArtifacts, generateDecisionProof, exportVerificationKey } from "../src/proof";
+import { submitProofInBackground, registerKurierVkInBackground } from "../src/kurier";
 import { decide } from "../src/decision";
 import { CIRCUIT_ZKEY_PATH } from "../src/config";
 import { baseTask, signBody, TEST_HMAC_SECRET } from "./fixtures";
@@ -241,4 +245,78 @@ test("11. Replay practice task asli practice_9e6ef3da -> REJECT + proof valid", 
   const ok = await snarkjs.groth16.verify(vk, generated.publicSignals, generated.proof);
   assert.equal(ok, true, "proof harus lolos groth16.verify");
   console.log(`   (proof practice task dibuat dalam ${proofMs}ms)`);
+});
+
+test("12. Registrasi VK Kurier saat start (register di-mock, tanpa jaringan)", async () => {
+  const fakeVk = { protocol: "groth16", curve: "bn128", nPublic: 13, vk_alpha_1: ["1", "2"] };
+  const prevKey = process.env.KURIER_API_KEY;
+  try {
+    // 12a. Key diset -> tepat 1x register dengan VK hasil export + log sukses.
+    process.env.KURIER_API_KEY = "test-key-123";
+    const calls: unknown[] = [];
+    const logs: string[] = [];
+    const res = await registerKurierVkInBackground((m) => logs.push(m), {
+      exportVk: async () => fakeVk,
+      register: async (vk) => {
+        calls.push(vk);
+        return { vkHash: "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0", raw: {} };
+      },
+      delayMs: 0,
+    });
+    assert.equal(calls.length, 1, "register harus dipanggil tepat sekali");
+    assert.deepEqual(calls[0], fakeVk, "register harus menerima VK hasil export");
+    assert.equal(res.registered, true);
+    assert.equal(res.skipped, false);
+    assert.equal(res.attempts, 1);
+    assert.match(logs.join("\n"), /VK terdaftar, vkHash=0x6b79/);
+
+    // 12b. Key kosong -> tidak ada register + log dilewati.
+    process.env.KURIER_API_KEY = "";
+    const calls2: unknown[] = [];
+    const logs2: string[] = [];
+    const res2 = await registerKurierVkInBackground((m) => logs2.push(m), {
+      exportVk: async () => fakeVk,
+      register: async (vk) => {
+        calls2.push(vk);
+        return { vkHash: "0x00", raw: {} };
+      },
+      delayMs: 0,
+    });
+    assert.equal(calls2.length, 0, "tanpa API key, register tidak boleh dipanggil");
+    assert.equal(res2.skipped, true);
+    assert.equal(res2.registered, false);
+    assert.match(logs2.join("\n"), /dilewati: KURIER_API_KEY belum diset/);
+
+    // 12c. Gagal 2x lalu sukses -> 3 percobaan, akhirnya terdaftar.
+    process.env.KURIER_API_KEY = "test-key-123";
+    let failing = 0;
+    const logs3: string[] = [];
+    const res3 = await registerKurierVkInBackground((m) => logs3.push(m), {
+      exportVk: async () => fakeVk,
+      register: async () => {
+        failing++;
+        if (failing < 3) throw new Error("Kurier 503: boom");
+        return { vkHash: "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0", raw: {} };
+      },
+      delayMs: 0,
+    });
+    assert.equal(failing, 3, "harus retry sampai 3x");
+    assert.equal(res3.registered, true);
+    assert.equal(res3.attempts, 3);
+    assert.match(logs3.join("\n"), /percobaan 1\/3/);
+    assert.match(logs3.join("\n"), /percobaan 2\/3/);
+  } finally {
+    process.env.KURIER_API_KEY = prevKey;
+  }
+
+  // 12d. Export VK asli dari .zkey -> groth16/bn128/nPublic=13 (jalur
+  // default yang dipakai saat start di produksi).
+  const realVk = (await exportVerificationKey()) as {
+    protocol: string;
+    curve: string;
+    nPublic: number;
+  };
+  assert.equal(realVk.protocol, "groth16");
+  assert.equal(realVk.curve, "bn128");
+  assert.equal(realVk.nPublic, 13);
 });
