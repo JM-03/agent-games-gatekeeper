@@ -23,8 +23,9 @@ import {
   PROOF_TIMEOUT_MS,
   SEEN_STORE_PATH,
   hmacSecretBytes,
+  hmacSecretCandidates,
 } from "./config";
-import { computeHmacHex, verifyHmac, SIGNATURE_HEADER } from "./hmac";
+import { computeHmacHex, verifyHmacAny, SIGNATURE_HEADER } from "./hmac";
 import { decide, parseTask, type GatekeeperTask } from "./decision";
 import { SeenStore, type StoredResponse } from "./store";
 import { generateDecisionProof, getCircuitInfo } from "./proof";
@@ -81,24 +82,49 @@ export function createApp(store: SeenStore): Express {
   });
 
   // Endpoint utama. express.raw supaya HMAC dihitung dari byte mentah.
+  // type "*/*": body mentah harus tertangkap apa pun Content-Type yang
+  // dikirim platform (kalau hanya "application/json", body dari Content-Type
+  // lain tidak akan jadi Buffer dan verifikasi pasti gagal).
   app.post(
     "/agent",
-    express.raw({ type: "application/json", limit: "1mb" }),
+    express.raw({ type: "*/*", limit: "1mb" }),
     async (req: Request, res: Response) => {
       const startedAt = Date.now();
       const rawBody = req.body as Buffer;
-      let secret: Buffer;
+      let secretCandidates: Buffer[];
       try {
-        secret = hmacSecretBytes();
+        secretCandidates = hmacSecretCandidates();
       } catch (err) {
         log(`[agent] ${(err as Error).message}`);
         res.status(500).json({ error: "server belum dikonfigurasi (HMAC secret kosong)" });
         return;
       }
 
-      // 1. HMAC dulu, SEBELUM parse JSON.
+      // 1. HMAC dulu, SEBELUM parse JSON — verifikasi toleran: coba semua
+      // penafsiran kunci (hex/base64/UTF-8) dan format signature (hex/base64).
       const signature = req.header(SIGNATURE_HEADER);
-      if (!verifyHmac(secret, rawBody, signature)) {
+      const check = verifyHmacAny(secretCandidates, rawBody, signature);
+      log(
+        `[agent] verifikasi HMAC: header=${check.headerPresent ? "ada" : "TIDAK ADA"} ` +
+          `panjang=${check.headerLength} encoding=${check.sigEncoding} ` +
+          `kandidat-cocok=${check.secretIndex} kandidat-total=${secretCandidates.length}.`
+      );
+      if (!check.ok) {
+        // Preflight tanpa signature sama sekali: handshake saja, bukan task
+        // bernilai — jawab 200 supaya health check tidak mati karena platform
+        // mengirim preflight tanpa tanda tangan. Task tanpa signature tetap 401.
+        if (!check.headerPresent) {
+          try {
+            const peeked = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
+            if (peeked.type === "agent-games.preflight.v1") {
+              log("[agent] preflight TANPA signature -> jawab ok (handshake).");
+              sendSigned(res, 200, { ok: true, protocolVersion: "v1" });
+              return;
+            }
+          } catch {
+            // bukan JSON — lanjut ke 401 di bawah
+          }
+        }
         log("[agent] HMAC tidak cocok — tolak (401).");
         res.status(401).json({ error: "invalid signature" });
         return;

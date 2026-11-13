@@ -29,20 +29,45 @@ export function getHmacSecretRaw(): string {
   return process.env.AGENT_GAMES_HMAC_SECRET || "";
 }
 
-/** Secret HMAC platform: 32 byte acak, ditampilkan sekali saat registrasi agent. */
-export function hmacSecretBytes(): Buffer {
-  const HMAC_SECRET_RAW = getHmacSecretRaw();
-  if (!HMAC_SECRET_RAW) {
+/** Secret HMAC platform: 32 byte acak, ditampilkan sekali saat registrasi agent.
+ *
+ * PELAJARAN 2026-11-13: tiga kali rotate → paste → redeploy tetap 401,
+ * padahal nilai di Railway sudah diverifikasi SAMA dengan yang ditampilkan
+ * dashboard. Jadi format kunci / signature platform TIDAK BOLEH ditebak
+ * satu macam saja. Fungsi ini mengembalikan SEMUA penafsiran byte yang
+ * masuk akal dari nilai env, urut dari yang paling mungkin kunci mentah:
+ * hex-decode (64 hex), base64-decode (44 char, 32 byte), lalu UTF-8.
+ * Verifikasi menerima kalau SALAH SATU kandidat cocok — lihat verifyHmacAny
+ * di hmac.ts. */
+export function hmacSecretCandidates(): Buffer[] {
+  const raw = getHmacSecretRaw().trim();
+  if (!raw) {
     throw new Error(
       "AGENT_GAMES_HMAC_SECRET belum diset. Ambil dari dashboard Agent Games (Rotate Secret) dan isi di env — jangan taruh di kode."
     );
   }
-  // Kalau secret berbentuk 64 karakter hex (32 byte), pakai sebagai byte.
-  // Kalau bukan hex, pakai byte UTF-8 dari string-nya.
-  if (/^[0-9a-fA-F]{64}$/.test(HMAC_SECRET_RAW.trim())) {
-    return Buffer.from(HMAC_SECRET_RAW.trim(), "hex");
+  const out: Buffer[] = [];
+  const push = (b: Buffer) => {
+    if (b.length > 0 && !out.some((x) => x.equals(b))) out.push(b);
+  };
+  if (/^[0-9a-fA-F]{64}$/.test(raw)) {
+    push(Buffer.from(raw, "hex"));
   }
-  return Buffer.from(HMAC_SECRET_RAW, "utf8");
+  if (/^[A-Za-z0-9+/=_-]{43,44}$/.test(raw)) {
+    try {
+      const decoded = Buffer.from(raw.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+      if (decoded.length === 32) push(decoded);
+    } catch {
+      // bukan base64 valid — abaikan kandidat ini
+    }
+  }
+  push(Buffer.from(raw, "utf8"));
+  return out;
+}
+
+/** Kandidat pertama = penafsiran utama (dipakai untuk menandatangani respons). */
+export function hmacSecretBytes(): Buffer {
+  return hmacSecretCandidates()[0];
 }
 
 export const PORT = Number(process.env.PORT || "3000");
