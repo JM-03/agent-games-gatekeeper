@@ -61,32 +61,33 @@ Plus: task yang strukturnya rusak / timestamp tidak valid -> REJECT
 
 ## Yang BELUM selesai — baca ini dulu
 
-### 1. Pemetaan input circuit (TODO paling penting)
+### 1. Pemetaan input circuit — SELESAI (nama terbukti, encoding best-effort)
 
-File circuit asli sudah ada dan terverifikasi (Groth16/bn128, nPublic=13),
-tapi **nama sinyal input circuit tidak dipublikasikan** di halaman resmi
-yang saya baca (file `.sym` tidak disediakan). Karena itu fungsi
-`buildCircuitInputs()` di `src/circuit-inputs.ts` masih melempar error
-yang jelas, dan agent mengirim keputusan **tanpa field proof**.
+**Update 2026-11-13 22:40 WIB:** nama 13 sinyal input circuit sudah
+**dibuktikan** dengan probing file WASM resmi (lihat
+`CIRCUIT_RESEARCH.md`): `registeredVkHash, proofVkHash, minimum,
+publicBalance, expiryBlock, currentBlock, recipient, conditionRecipient,
+amount, maxTransfer, taskId, decision, salt` (decision 0 = REJECT,
+1 = APPROVE). `buildCircuitInputs()` di `src/circuit-inputs.ts` sudah
+diisi dan `CIRCUIT_INPUTS_CONFIGURED = true` — agent sekarang mengirim
+`proof` + `public_signals` di respons, dan test replay practice task
+(`npm test`, test 11) membuktikan proof-nya lolos `groth16.verify`.
 
-Akibatnya (jujur, sesuai halaman event): keputusan benar tetap +12, tapi
-ada penalti **-2 per task** ("Missing / invalid proof") dan **tidak ada
-reliability bonus**.
+**TAPI: encoding-nya masih UNVERIFIED (best-effort).** Platform tidak
+mempublikasikan cara mengubah nilai task menjadi field element di mana
+pun (sudah dicek /build, /guide, /rules, halaman event, /api/circuit-info,
+docs.zkverify.io, DAN starter prompt /build lewat browser asli). Yang
+dipakai sekarang: Poseidon atas vk 32-byte yang dipecah dua limb 16-byte,
+Poseidon atas byte UTF-8 task_id (dirangkai sponge-style), BigInt untuk
+address/angka, salt 0. Kalau encoding ini salah, platform menolak proof
+-> penalti **-2 per task** ("Missing / invalid proof"), SAMA seperti
+tidak mengirim proof — jadi tidak ada downside, hanya upside kalau
+ternyata benar. Kegagalan proof tidak pernah menggagalkan task: server
+selalu fallback ke respons tanpa proof.
 
-Cara mengisi TODO ini:
-
-1. Jalankan satu **practice task** dari dashboard — practice formatnya sama
-   dengan scored task. Perhatikan apakah platform menampilkan
-   `public_signals` yang diharapkan.
-2. Atau tanya di Discord resmi zkVerify: https://discord.gg/zkverify —
-   tanyakan: *"What are the input signal names and public input layout of
-   the gatekeeper circuit (gatekeeper.wasm / gatekeeper_final.zkey,
-   nPublic=13)?"*
-3. Atau cek "protocol documentation" yang dirujuk halaman `/build`.
-
-Setelah dapat jawabannya: isi `buildCircuitInputs()` di
-`src/circuit-inputs.ts`, ubah `CIRCUIT_INPUTS_CONFIGURED` menjadi `true`,
-lalu jalankan `npm test`.
+Kalau encoding resmi diketahui (Discord resmi zkVerify:
+https://discord.gg/zkverify, atau protocol docs), perbaiki fungsi
+`*_toField` di `src/circuit-inputs.ts` — nama sinyalnya sudah benar.
 
 ### 2. Yang harus dilakukan Elgi sendiri (tidak bisa diwakilkan)
 
@@ -107,7 +108,7 @@ lalu jalankan `npm test`.
 - [ ] Jalankan **preflight + minimal 1 practice task** dari dashboard,
       cek log Railway: harus muncul `preflight -> ok` dan keputusan
       APPROVE/REJECT yang benar.
-- [ ] Kalau pemetaan circuit sudah didapat (TODO no. 1), isi dan deploy ulang.
+- [ ] Pemetaan circuit sudah diisi (TODO no. 1 selesai, encoding best-effort) — deploy ulang supaya Railway menjalankan kode proof.
 - [ ] Catatan: tidak ada kolom wallet di dashboard (dicek 2026-11-13) —
       situsnya bilang detail payout dikumpulkan langsung dari pemenang
       setelah kompetisi tutup.
@@ -161,7 +162,7 @@ agent-games-gatekeeper/
 │   ├── decision.ts         # logika 7 cek (deterministik)
 │   ├── store.ts            # idempotency + anti-reuse (file JSON)
 │   ├── proof.ts            # snarkjs fullProve + cek artefak circuit
-│   ├── circuit-inputs.ts   # *** TODO: pemetaan input circuit ***
+│   ├── circuit-inputs.ts   # input circuit (nama terbukti; encoding best-effort)
 │   └── kurier.ts           # client Kurier (register-vk/submit/job-status)
 ├── tests/
 │   ├── agent.test.ts       # 10 test
