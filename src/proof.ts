@@ -94,7 +94,7 @@ export async function generateDecisionProof(
   if (!fs.existsSync(CIRCUIT_WASM_PATH) || !fs.existsSync(CIRCUIT_ZKEY_PATH)) {
     throw new Error("File circuit tidak ditemukan di circuits/ (wasm/zkey).");
   }
-  const input = buildCircuitInputs(task, decision);
+  const input = await buildCircuitInputs(task, decision);
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const snarkjs = require("snarkjs");
   const result = (await withTimeout(
