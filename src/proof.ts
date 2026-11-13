@@ -40,6 +40,13 @@ export function getCircuitInfo(): CircuitInfo {
   };
 }
 
+/** Ekstrak verification key mentah dari .zkey (dipakai untuk registrasi ke Kurier). */
+export async function exportVerificationKey(): Promise<unknown> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const snarkjs = require("snarkjs");
+  return snarkjs.zKey.exportVerificationKey(CIRCUIT_ZKEY_PATH);
+}
+
 /** Ekstrak verification key dari .zkey dan cek konsistensinya dengan
  *  fakta publik (groth16 / bn128 / nPublic 13). Dipakai di /health dan test. */
 export async function verifyCircuitArtifacts(): Promise<{
@@ -49,9 +56,11 @@ export async function verifyCircuitArtifacts(): Promise<{
   nPublic: number;
   detail: string;
 }> {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const snarkjs = require("snarkjs");
-  const vk = await snarkjs.zKey.exportVerificationKey(CIRCUIT_ZKEY_PATH);
+  const vk = (await exportVerificationKey()) as {
+    protocol: string;
+    curve: string;
+    nPublic: number;
+  };
   const ok =
     vk.protocol === CIRCUIT_INFO.protocol &&
     vk.curve === CIRCUIT_INFO.curve &&

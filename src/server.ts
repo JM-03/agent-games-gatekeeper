@@ -30,7 +30,7 @@ import { decide, parseTask, type GatekeeperTask } from "./decision";
 import { SeenStore, type StoredResponse } from "./store";
 import { generateDecisionProof, getCircuitInfo } from "./proof";
 import { CircuitInputMappingNotConfigured } from "./circuit-inputs";
-import { submitProofInBackground } from "./kurier";
+import { submitProofInBackground, registerKurierVkInBackground } from "./kurier";
 
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -263,6 +263,11 @@ export function startServer(): void {
     log(`agent-games-gatekeeper jalan di port ${PORT} — POST /agent, GET /health`);
     log(`circuit: ${getCircuitInfo().protocol}/${getCircuitInfo().curve}, nPublic=${getCircuitInfo().nPublic}`);
   });
+  // Registrasi VK ke Kurier di BACKGROUND (tidak memblokir listen / task):
+  // tanpa ini, submitProof() mengirim vkRegistered: true padahal Kurier
+  // belum pernah menerima VK-nya, dan job proof langsung Failed (terbukti
+  // 2026-11-13 23:08 WIB). Helper ini tidak pernah melempar.
+  void registerKurierVkInBackground(log);
 }
 
 // Dipakai test: bangun app dengan store sementara tanpa listen.

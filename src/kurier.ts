@@ -23,6 +23,7 @@
  */
 
 import { KURIER_API_URL, getKurierApiKey, GATEKEEPER_VK_HASH } from "./config";
+import { exportVerificationKey } from "./proof";
 
 export interface KurierResult {
   skipped: boolean;
@@ -81,6 +82,73 @@ export async function registerVk(vk: unknown): Promise<{ vkHash: string; raw: un
     (typeof rec.uniq_vk_hash === "string" && rec.uniq_vk_hash) ||
     GATEKEEPER_VK_HASH;
   return { vkHash, raw };
+}
+
+export interface VkRegistrationResult {
+  skipped: boolean;
+  registered: boolean;
+  vkHash?: string;
+  attempts: number;
+  reason?: string;
+}
+
+/**
+ * Registrasi VK ke Kurier saat server start (dipanggil dari startServer,
+ * di background — TIDAK PERNAH melempar dan tidak memblokir listen/task).
+ *
+ * LATAR: 2026-11-13 23:08 WIB, job Kurier 86c4a954-df7c-11f1-838e-1e6a0d14f999
+ * berakhir "Failed" ~223ms setelah submit, karena registerVk() TIDAK PERNAH
+ * dipanggil di mana pun sementara submitProof() mengirim vkRegistered: true.
+ * Kurier tidak punya verification key circuit ini, jadi proof langsung gagal.
+ * Helper ini menutup celah itu: export VK dari .zkey lalu daftarkan sekali
+ * saat start, retry sampai 3x kalau Kurier tidak terjangkau.
+ *
+ * Tanpa KURIER_API_KEY: dicatat sekali lalu dilewati (server jalan normal,
+ * submit proof juga akan dilewati seperti sebelumnya).
+ */
+export async function registerKurierVkInBackground(
+  log: (msg: string) => void,
+  opts: {
+    exportVk?: () => Promise<unknown>;
+    register?: (vk: unknown) => Promise<{ vkHash: string; raw: unknown }>;
+    attempts?: number;
+    delayMs?: number;
+  } = {}
+): Promise<VkRegistrationResult> {
+  const maxAttempts = opts.attempts ?? 3;
+  const delayMs = opts.delayMs ?? 5000;
+  if (!getKurierApiKey()) {
+    log("[kurier] registrasi VK dilewati: KURIER_API_KEY belum diset.");
+    return { skipped: true, registered: false, attempts: 0 };
+  }
+  const exportVk = opts.exportVk ?? exportVerificationKey;
+  const register = opts.register ?? registerVk;
+  let vk: unknown;
+  try {
+    vk = await exportVk();
+  } catch (err) {
+    const msg = (err as Error).message;
+    log(`[kurier] registrasi VK gagal: tidak bisa export VK dari .zkey: ${msg}`);
+    return { skipped: false, registered: false, attempts: 0, reason: msg };
+  }
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { vkHash } = await register(vk);
+      log(`[kurier] VK terdaftar, vkHash=${vkHash}`);
+      return { skipped: false, registered: true, vkHash, attempts: attempt };
+    } catch (err) {
+      lastError = err as Error;
+      log(`[kurier] registrasi VK gagal (percobaan ${attempt}/${maxAttempts}): ${lastError.message}`);
+      if (attempt < maxAttempts && delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  log(
+    `[kurier] registrasi VK gagal setelah ${maxAttempts} percobaan — submit proof akan gagal sampai VK terdaftar.`
+  );
+  return { skipped: false, registered: false, attempts: maxAttempts, reason: lastError?.message };
 }
 
 /** Submit satu proof. Mengembalikan jobId untuk polling. */
