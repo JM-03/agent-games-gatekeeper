@@ -13,6 +13,8 @@
  *  8. Task rusak (field hilang) -> REJECT INVALID_TASK (fail-closed).
  *  9. Artefak circuit asli (.zkey) -> VK groth16/bn128/nPublic=13.
  * 10. Kurier tanpa API key -> dilewati (skipped), bukan error.
+ * 11. Replay practice task asli (practice_9e6ef3da, 2026-11-13) -> REJECT /
+ *     VK_SUBSTITUTION + proof Groth16 yang lolos groth16.verify.
  */
 
 import { test, before, after } from "node:test";
@@ -23,8 +25,10 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { createTestApp } from "../src/server";
 import { SeenStore } from "../src/store";
-import { verifyCircuitArtifacts } from "../src/proof";
+import { verifyCircuitArtifacts, generateDecisionProof } from "../src/proof";
 import { submitProofInBackground } from "../src/kurier";
+import { decide } from "../src/decision";
+import { CIRCUIT_ZKEY_PATH } from "../src/config";
 import { baseTask, signBody, TEST_HMAC_SECRET } from "./fixtures";
 
 process.env.AGENT_GAMES_HMAC_SECRET = TEST_HMAC_SECRET;
@@ -109,6 +113,10 @@ test("2. Task VALID yang ditandatangani benar -> APPROVE + respons ikut ditandat
   assert.equal(json.decision, "APPROVE");
   assert.equal(json.reason_code, "VALID_CONDITION");
   assert.equal(json.proof_tx, task.input.proof_tx);
+  // Respons harus membawa proof + 13 public signals (wiring server langkah 6).
+  assert.ok(json.proof, "respons harus membawa proof");
+  assert.ok(Array.isArray(json.public_signals), "respons harus membawa public_signals");
+  assert.equal((json.public_signals as string[]).length, 13);
   // Respons harus punya signature HMAC yang valid atas raw body-nya.
   assert.ok(headers["x-agent-games-signature"], "header signature respons harus ada");
   const expected = signBody(TEST_HMAC_SECRET, json).signature;
@@ -192,4 +200,45 @@ test("10. Kurier tanpa API key -> dilewati, bukan error", async () => {
   const result = await submitProofInBackground({ dummy: true }, ["1", "2"], (m) => messages.push(m));
   assert.equal(result.skipped, true);
   assert.match(result.reason || "", /KURIER_API_KEY/);
+});
+
+test("11. Replay practice task asli practice_9e6ef3da -> REJECT + proof valid", async () => {
+  // Payload persis seperti yang ditampilkan dashboard "Sanitized Request"
+  // pada practice task 2026-11-13 22:17 WIB (task_id + semua field input).
+  // issued_at/deadline_at dibuat segar supaya decide() tidak menolak
+  // karena deadline asli sudah lewat — yang diuji di sini adalah keputusan
+  // dan proof-nya, bukan timestamp aslinya.
+  const task = baseTask({
+    task_id: "practice_9e6ef3da-ead8-4ccd-b792-51dfcd7cf5cf",
+    input: {
+      registered_vk: "0x6d79c0012a6d8651f3e13bc4d2a20370280ab49780c99c5316d4168bfbad77b0",
+      proof_vk: "0x6c65609f1c56fd1fd4e9737f90d2220f4b95f1d507f1adf6899085bd74be047",
+      minimum: "1000",
+      public_balance: "1460",
+      expiry_block: 843000,
+      current_block: 842000,
+      recipient: "0xabcdef1234567890abcdef1234567890abcdef12",
+      condition_recipient: "0xabcdef1234567890abcdef1234567890abcdef12",
+      amount: "500",
+      max_transfer: "1000",
+      proof_tx: "0x9e6ef3daead84ccdb79251dfcd7cf5cf",
+    },
+  });
+  // Keputusan harus sama dengan yang dicatat dashboard: REJECT karena
+  // proof_vk != registered_vk (VK_SUBSTITUTION); semua cek lain lolos.
+  const result = decide(task, () => false);
+  assert.equal(result.decision, "REJECT");
+  assert.equal(result.reason_code, "VK_SUBSTITUTION");
+  // Proof harus berhasil dibuat dan lolos verifikasi Groth16 terhadap
+  // verification key circuit resmi (.zkey).
+  const t0 = Date.now();
+  const generated = await generateDecisionProof(task, "REJECT", 60_000);
+  const proofMs = Date.now() - t0;
+  assert.equal(generated.publicSignals.length, 13);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const snarkjs = require("snarkjs");
+  const vk = await snarkjs.zKey.exportVerificationKey(CIRCUIT_ZKEY_PATH);
+  const ok = await snarkjs.groth16.verify(vk, generated.publicSignals, generated.proof);
+  assert.equal(ok, true, "proof harus lolos groth16.verify");
+  console.log(`   (proof practice task dibuat dalam ${proofMs}ms)`);
 });
