@@ -19,6 +19,13 @@
  *     key diset -> tepat 1x register-vk dengan VK hasil export + log sukses;
  *     key kosong -> tidak ada register + log dilewati; gagal 2x lalu sukses
  *     -> 3 percobaan; export VK asli dari .zkey -> groth16/bn128/nPublic=13.
+ * 13. Encoding BARU (mod-p + keccak, 2026-11-14): golden values untuk
+ *     vkHashToField dan taskIdToField, termasuk reduksi nilai > P.
+ * 14. Expiry SAMA DENGAN blok sekarang (current == expiry) -> REJECT /
+ *     EXPIRED_CONDITION (circuit hanya menerima current < expiry).
+ * 15. Task VALID_CONDITION -> proof Groth16 dengan encoding BARU, lolos
+ *     groth16.verify, selfVerified=true, dan public signal taskId sama
+ *     dengan keccak256(task_id) % P.
  */
 
 import { test, before, after } from "node:test";
@@ -33,6 +40,11 @@ import { verifyCircuitArtifacts, generateDecisionProof, exportVerificationKey } 
 import { submitProofInBackground, registerKurierVkInBackground } from "../src/kurier";
 import { decide } from "../src/decision";
 import { CIRCUIT_ZKEY_PATH } from "../src/config";
+import {
+  BN128_FIELD_PRIME,
+  vkHashToField,
+  taskIdToField,
+} from "../src/circuit-inputs";
 import { baseTask, signBody, TEST_HMAC_SECRET } from "./fixtures";
 
 process.env.AGENT_GAMES_HMAC_SECRET = TEST_HMAC_SECRET;
@@ -319,4 +331,104 @@ test("12. Registrasi VK Kurier saat start (register di-mock, tanpa jaringan)", a
   assert.equal(realVk.protocol, "groth16");
   assert.equal(realVk.curve, "bn128");
   assert.equal(realVk.nPublic, 13);
+});
+
+test("13. Encoding BARU: vk BigInt % P, taskId keccak256 % P (golden values)", async () => {
+  // Prima field bn128 (BN254) — sama dengan yang dipakai snarkjs/circom.
+  assert.equal(
+    BN128_FIELD_PRIME.toString(),
+    "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+  );
+  // vk hash resmi Gatekeeper (0x6b79...): BigInt % P.
+  assert.equal(
+    vkHashToField("0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0"),
+    "4836144126773920907502496244340012141761656471453348073975163706578152814510"
+  );
+  // vk fixture (0x7d3a...f291): BigInt % P.
+  assert.equal(
+    vkHashToField("0x7d3a00000000000000000000000000000000000000000000000000000000f291"),
+    "12865097458986894393288539788301931603300749965206523872066043227887187849871"
+  );
+  // taskId: keccak256(UTF-8) % P.
+  assert.equal(
+    taskIdToField("gk_test_001"),
+    "12285206862557242059294343006181173650373945713092228825753519331833957760831"
+  );
+  assert.equal(
+    taskIdToField("practice_9e6ef3da-ead8-4ccd-b792-51dfcd7cf5cf"),
+    "6045810861643639752822587413525375509902079055848561636576741642069158778557"
+  );
+  // Reduksi benar-benar terjadi untuk nilai > P (0xff..ff 32 byte).
+  assert.equal(
+    vkHashToField("0x" + "ff".repeat(32)),
+    ((2n ** 256n - 1n) % BN128_FIELD_PRIME).toString()
+  );
+  // Semua hasil harus < P (field element valid).
+  for (const v of [
+    vkHashToField("0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0"),
+    taskIdToField("gk_test_001"),
+  ]) {
+    assert.ok(BigInt(v) < BN128_FIELD_PRIME, "hasil encoding harus < P");
+  }
+});
+
+test("14. Expiry SAMA DENGAN blok sekarang -> REJECT EXPIRED_CONDITION", async () => {
+  // current_block == expiry_block: circuit hanya menerima current < expiry.
+  const equal = baseTask({
+    task_id: "gk_test_expiry_equal",
+    input: { current_block: 19842201 },
+  });
+  const result = decide(equal, () => false);
+  assert.equal(result.decision, "REJECT");
+  assert.equal(result.reason_code, "EXPIRED_CONDITION");
+  // Satu blok sebelum expiry masih valid (bukan expired).
+  const before = baseTask({
+    task_id: "gk_test_expiry_before",
+    input: { current_block: 19842200 },
+  });
+  const resultBefore = decide(before, () => false);
+  assert.equal(resultBefore.decision, "APPROVE");
+  assert.equal(resultBefore.reason_code, "VALID_CONDITION");
+});
+
+test("15. Task VALID_CONDITION -> proof dengan encoding BARU, verify OK", async () => {
+  // max_transfer dibedakan dari minimum (2000 vs 1000) supaya urutan
+  // publicSignals bisa dibedakan posisi per posisi.
+  const task = baseTask({ task_id: "gk_test_valid_proof", input: { max_transfer: "2000" } });
+  assert.equal(decide(task, () => false).decision, "APPROVE");
+  const t0 = Date.now();
+  const generated = await generateDecisionProof(task, "APPROVE", 60_000);
+  const proofMs = Date.now() - t0;
+  assert.equal(generated.publicSignals.length, 13);
+  assert.equal(generated.selfVerified, true, "proof harus lolos self-verify lokal");
+  // Verifikasi independen dengan VK resmi (bukan hanya self-verify internal).
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const snarkjs = require("snarkjs");
+  const vk = await snarkjs.zKey.exportVerificationKey(CIRCUIT_ZKEY_PATH);
+  const ok = await snarkjs.groth16.verify(vk, generated.publicSignals, generated.proof);
+  assert.equal(ok, true, "proof VALID harus lolos groth16.verify");
+  // Layout publicSignals (TERBUKTI lewat dump proof lokal — lihat header
+  // src/circuit-inputs.ts): [0]=evaluationCommitment, [1]=registeredVkHash,
+  // [2]=proofVkHash, [3]=minimum, [4]=publicBalance, [5]=expiryBlock,
+  // [6]=currentBlock, [7]=recipient, [8]=conditionRecipient, [9]=amount,
+  // [10]=maxTransfer, [11]=decision, [12]=taskId.
+  const s = generated.publicSignals;
+  assert.equal(s[1], vkHashToField(task.input.registered_vk));
+  assert.equal(s[2], vkHashToField(task.input.proof_vk));
+  assert.equal(s[3], "1000"); // minimum
+  assert.equal(s[4], "1460"); // publicBalance
+  assert.equal(s[5], "19842201"); // expiryBlock
+  assert.equal(s[6], "19832000"); // currentBlock
+  assert.equal(s[7], BigInt(task.input.recipient).toString()); // recipient
+  assert.equal(s[8], BigInt(task.input.condition_recipient).toString()); // conditionRecipient
+  assert.equal(s[9], "500"); // amount
+  assert.equal(s[10], "2000"); // maxTransfer (bukan minimum — dibedakan di sini)
+  assert.equal(s[11], "1"); // decision APPROVE
+  assert.equal(s[12], taskIdToField(task.task_id)); // taskId = keccak256 % P
+  // signal[0] = evaluationCommitment (dihitung circuit dari input + salt):
+  // field element valid, dan BUKAN salah satu nilai input task.
+  assert.ok(BigInt(s[0]) < BN128_FIELD_PRIME, "signal[0] harus < P");
+  assert.notEqual(s[0], s[1]);
+  assert.notEqual(s[0], s[12]);
+  console.log(`   (proof VALID dengan encoding baru dibuat dalam ${proofMs}ms)`);
 });
