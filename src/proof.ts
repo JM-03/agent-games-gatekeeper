@@ -18,6 +18,8 @@ import type { GatekeeperTask, Decision } from "./decision";
 export interface GeneratedProof {
   proof: unknown;
   publicSignals: string[];
+  /** Proof lolos groth16.verify lokal terhadap VK resmi (.zkey). */
+  selfVerified: boolean;
 }
 
 export interface CircuitInfo {
@@ -91,6 +93,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * - Kalau pemetaan input belum diisi -> throw CircuitInputMappingNotConfigured
  *   (pemanggil HARUS menangkap ini dan tetap mengirim keputusan tanpa proof).
  * - fullProve dibatasi PROOF_TIMEOUT_MS supaya tidak melewati deadline 60 detik.
+ * - Setelah fullProve, proof DIVERIFIKASI LOKAL terhadap VK resmi (.zkey)
+ *   sebelum dikembalikan (pola yang sama dipakai pecker/chandra/zeel/nestic).
+ *   Kalau verifikasi lokal gagal, proof itu TIDAK ADA GUNANYA (platform
+ *   pasti menolaknya, -2 sama seperti tanpa proof) -> throw, supaya server
+ *   fallback ke respons tanpa proof dan tidak mengirimnya ke Kurier.
  */
 export async function generateDecisionProof(
   task: GatekeeperTask,
@@ -103,7 +110,7 @@ export async function generateDecisionProof(
   if (!fs.existsSync(CIRCUIT_WASM_PATH) || !fs.existsSync(CIRCUIT_ZKEY_PATH)) {
     throw new Error("File circuit tidak ditemukan di circuits/ (wasm/zkey).");
   }
-  const input = await buildCircuitInputs(task, decision);
+  const input = buildCircuitInputs(task, decision);
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const snarkjs = require("snarkjs");
   const result = (await withTimeout(
@@ -112,5 +119,27 @@ export async function generateDecisionProof(
     "snarkjs fullProve"
   )) as { proof: unknown; publicSignals: unknown[] };
   const { proof, publicSignals } = result;
-  return { proof, publicSignals: publicSignals.map(String) };
+  const signals = publicSignals.map(String);
+  // Self-verify lokal terhadap VK resmi — VK di-cache supaya tidak
+  // di-export ulang setiap task.
+  const vk = await getCachedVerificationKey();
+  const selfVerified = (await withTimeout(
+    snarkjs.groth16.verify(vk, signals, proof),
+    10_000,
+    "snarkjs groth16.verify"
+  )) as boolean;
+  if (!selfVerified) {
+    throw new Error("proof gagal verifikasi lokal (groth16.verify = false) — tidak dikirim.");
+  }
+  return { proof, publicSignals: signals, selfVerified: true };
+}
+
+/** Cache VK hasil export supaya self-verify per task tidak mengulang export. */
+let cachedVk: unknown | null = null;
+
+async function getCachedVerificationKey(): Promise<unknown> {
+  if (!cachedVk) {
+    cachedVk = await exportVerificationKey();
+  }
+  return cachedVk;
 }

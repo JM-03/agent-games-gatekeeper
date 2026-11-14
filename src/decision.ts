@@ -234,9 +234,11 @@ export function decide(
     return { decision: "REJECT", reason_code: "AMOUNT_OVERFLOW", detail: "amount > max_transfer" };
   }
 
-  // 5. EXPIRED_CONDITION — blok sekarang sudah lewat expiry.
-  if (inp.current_block > inp.expiry_block) {
-    return { decision: "REJECT", reason_code: "EXPIRED_CONDITION", detail: "current_block > expiry_block" };
+  // 5. EXPIRED_CONDITION — blok sekarang sudah lewat expiry. Sama dengan
+  //    expiry (current == expiry) berarti SUDAH kedaluwarsa: circuit hanya
+  //    menerima currentBlock < expiryBlock (lihat CIRCUIT_RESEARCH.md).
+  if (inp.current_block >= inp.expiry_block) {
+    return { decision: "REJECT", reason_code: "EXPIRED_CONDITION", detail: "current_block >= expiry_block" };
   }
 
   // 6. PROOF_REUSED — proof_tx ini sudah pernah DITERIMA sebelumnya.

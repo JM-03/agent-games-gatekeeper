@@ -218,7 +218,14 @@ export function createApp(store: SeenStore): Express {
           );
           proof = generated.proof;
           publicSignals = generated.publicSignals;
-          log(`[agent] proof lokal dibuat (${publicSignals.length} public signals).`);
+          // Baris log ini yang dipakai untuk mendiagnosis Ronde 02 dari log
+          // saja: proof dibuat + lolos self-verify lokal + dilampirkan ke
+          // respons. Kalau platform menolak proof yang self-verified,
+          // masalahnya ada di encoding/platform — bukan di pembuatan proof.
+          log(
+            `[agent] proof task ${task.task_id}: dibuat (${publicSignals.length} public signals), ` +
+              `self-verified=${generated.selfVerified}, dilampirkan ke respons (${result.decision}/${result.reason_code}).`
+          );
         } catch (err) {
           if (err instanceof CircuitInputMappingNotConfigured) {
             log("[agent] proof dilewati: pemetaan input circuit belum diisi (lihat src/circuit-inputs.ts). Keputusan tetap dikirim.");
