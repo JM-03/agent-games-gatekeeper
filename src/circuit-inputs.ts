@@ -29,9 +29,21 @@
  *   TIDAK menentukan urutan public signals; urutan ditentukan circuit.
  *
  * ENCODING (TERBUKTI 2026-11-14, lihat
- * ~/workspace/wildcard-research/LEADERBOARD-RESEARCH-REPORT.md §5.2/§6):
+ * ~/workspace/wildcard-research/LEADERBOARD-RESEARCH-REPORT.md §5.2/§6;
+ * taskId DIPERBAIKI 2026-11-16 — lihat di bawah):
  * - registeredVkHash / proofVkHash: BigInt(hex) % P, P = prima field bn128.
- * - taskId: keccak256(byte UTF-8 task_id) % P.
+ * - taskId: UUID di ujung task_id sebagai integer 128-bit untuk id format
+ *   R03 (`task_R03_<uuid>`); keccak256(byte UTF-8 task_id) % P hanya
+ *   fallback untuk id tanpa UUID (format R01 `gk_...`, `task_R03_aec58a03`).
+ *   Sumber konfirmasi: zeel `wrangler.toml:43` TASKID_ENCODING="uuidTail"
+ *   CONFIRMED 2026-11-15; regex identik di zeel
+ *   `prover/maps/gatekeeper.mjs:34-40` dan chandra `src/encoding.ts:94-102`.
+ *   Perbedaan R01 vs R03: id R01 (`gk_24_9d1`, tanpa UUID) jatuh ke fallback
+ *   keccak sehingga keccak terverifikasi saat itu; id R03
+ *   (`task_R03_<uuid>`) diharapkan platform sebagai integer 128-bit.
+ *   Inilah root cause 0-verified kita di R02/R03: taskIdToField lama selalu
+ *   keccak256(utf8 task_id) % P, sehingga publicSignals[12] tidak cocok
+ *   dengan yang diharapkan platform untuk id format R03.
  * - recipient / conditionRecipient, minimum, publicBalance, expiryBlock,
  *   currentBlock, amount, maxTransfer: BigInt langsung (nilainya < P,
  *   jadi identik dengan BigInt % P).
@@ -44,10 +56,13 @@
  * - Skor leaderboard Ronde 01 terurai persis: skor = 80 + 2,625 x proof
  *   terverifikasi. Semua 7 agent teratas 8/8 benar, 0 timeout; pecker
  *   87,9 = 3/8 proof terverifikasi, enam agent di 80,0 = 0/8 terverifikasi.
- * - Zeel (vk-sentinel) mencatat perbandingan terkontrol: encoding UUID-tail
- *   mereka 0/6 proof terverifikasi pada 13 Nov, sementara proof pecker
- *   dengan keccak256(utf8 task_id) mod p terverifikasi pada task yang sama.
- * - Skema yang sama dipakai pecker, zeel, chandra, nestic.
+ * - Zeel (vk-sentinel) mencatat perbandingan terkontrol pada 13 Nov (id
+ *   format R01, tanpa UUID): encoding UUID-tail mereka 0/6 proof
+ *   terverifikasi, sementara proof pecker dengan keccak256(utf8 task_id)
+ *   mod p terverifikasi pada task yang sama — konsisten dengan fallback
+ *   keccak untuk id tanpa UUID. Untuk id format R03 (`task_R03_<uuid>`)
+ *   platform mengharapkan uuidTail (zeel CONFIRMED 2026-11-15).
+ * - Skema taskId sekarang mirror zeel/chandra: uuidTail + keccak fallback.
  *
  * SKEMA LAMA (DIGANTI 2026-11-14 — JANGAN dipakai lagi):
  * - vk: Poseidon (circomlibjs) atas dua limb 16-byte; taskId: Poseidon
@@ -107,11 +122,20 @@ export function vkHashToField(vkHex: string): string {
 }
 
 /**
- * string task_id -> field element: keccak256(byte UTF-8 task_id) % P.
- * Skema yang dipakai pecker/zeel/chandra/nestic (terverifikasi di Ronde 01).
+ * string task_id -> field element.
+ * - Id format R03 (`task_R03_<uuid>`): UUID di ujung task_id sebagai
+ *   integer 128-bit (hex tanpa dash) — ini yang diharapkan platform.
+ * - Id tanpa UUID (format R01 `gk_...`, `task_R03_aec58a03`):
+ *   keccak256(byte UTF-8 task_id) % P (fallback).
+ * Mirror persis zeel/chandra (lihat header file ini).
  * Mengembalikan decimal string (format yang diterima snarkjs fullProve).
  */
+/** Trailing UUID di ujung task_id, mis. `task_R03_16e835e2-9c68-4307-30da-4b8a25ebd319`. */
+const UUID_TAIL = /[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
+
 export function taskIdToField(taskId: string): string {
+  const m = UUID_TAIL.exec(taskId);
+  if (m) return BigInt("0x" + m[0].replace(/-/g, "")).toString();
   const hashHex = keccak256(Buffer.from(taskId, "utf8"));
   return (BigInt(hashHex) % BN128_FIELD_PRIME).toString();
 }
