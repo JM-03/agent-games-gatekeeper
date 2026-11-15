@@ -8,7 +8,9 @@
  *  3. Signature salah -> 401, tidak ada keputusan.
  *  4. Tiap trap dari ensiklopedia -> REJECT dengan reason_code yang benar.
  *  5. Replay task_id yang sama -> respons identik (idempotency).
- *  6. Proof yang sudah diterima lalu dipakai lagi -> PROOF_REUSED.
+ *  6. Proof yang sudah diterima lalu dipakai lagi -> PROOF_REUSED, respons
+ *     membawa sinyal publik + proof:null (bukan respons kosong — respons
+ *     kosong pernah ditolak platform di Ronde 03 -> TIMEOUT).
  *  7. Preflight -> { ok: true, protocolVersion: "v1" } + signed.
  *  8. Task rusak (field hilang) -> REJECT INVALID_TASK (fail-closed).
  *  9. Artefak circuit asli (.zkey) -> VK groth16/bn128/nPublic=13.
@@ -26,6 +28,8 @@
  * 15. Task VALID_CONDITION -> proof Groth16 dengan encoding BARU, lolos
  *     groth16.verify, selfVerified=true, dan public signal taskId sama
  *     dengan keccak256(task_id) % P.
+ * 16. buildPublicSignals (fallback saat proof gagal) == sinyal proof asli
+ *     [1..12]; [0] placeholder "0" (platform melewati evaluationCommitment).
  */
 
 import { test, before, after } from "node:test";
@@ -44,6 +48,7 @@ import {
   BN128_FIELD_PRIME,
   vkHashToField,
   taskIdToField,
+  buildPublicSignals,
 } from "../src/circuit-inputs";
 import { baseTask, signBody, TEST_HMAC_SECRET } from "./fixtures";
 
@@ -178,10 +183,27 @@ test("6. Proof yang sudah DITERIMA lalu dipakai lagi -> PROOF_REUSED", async () 
   // gk_test_valid (test 2) sudah APPROVE dengan proof_tx 0xa4c1...8ff1.
   const reused = baseTask({ task_id: "gk_test_reuse", input: { proof_tx: "0xa4c1000000000000000000000000000000000000000000000000000000008ff1" } });
   const { raw, signature } = signBody(TEST_HMAC_SECRET, reused);
-  const { status, json } = await postAgent(raw, signature);
+  const { status, headers, json } = await postAgent(raw, signature);
   assert.equal(status, 200);
   assert.equal(json.decision, "REJECT");
   assert.equal(json.reason_code, "PROOF_REUSED");
+  // Akal PROOF_REUSED (task R03 ke-11 TIMEOUT karena respons tanpa proof
+  // ditolak platform): respons harus membawa sinyal publik yang jujur +
+  // proof:null eksplisit — bukan respons kosong.
+  assert.equal(json.proof, null, "PROOF_REUSED tidak punya proof — harus null eksplisit");
+  assert.ok(Array.isArray(json.public_signals), "respons harus membawa public_signals");
+  const s = json.public_signals as string[];
+  assert.equal(s.length, 13);
+  assert.equal(s[0], "0", "index 0 placeholder — platform melewati evaluationCommitment");
+  assert.equal(s[1], vkHashToField(reused.input.registered_vk));
+  assert.equal(s[2], vkHashToField(reused.input.proof_vk));
+  assert.equal(s[3], "1000"); // minimum (fixture)
+  assert.equal(s[11], "0", "decision REJECT");
+  assert.equal(s[12], taskIdToField("gk_test_reuse"));
+  // Respons tetap ditandatangani (signature mencakup body baru).
+  assert.ok(headers["x-agent-games-signature"], "header signature respons harus ada");
+  const expected = signBody(TEST_HMAC_SECRET, json).signature;
+  assert.equal(headers["x-agent-games-signature"], expected);
 });
 
 test("7. Preflight -> { ok: true, protocolVersion: v1 } dan ditandatangani", async () => {
@@ -431,4 +453,23 @@ test("15. Task VALID_CONDITION -> proof dengan encoding BARU, verify OK", async 
   assert.notEqual(s[0], s[1]);
   assert.notEqual(s[0], s[12]);
   console.log(`   (proof VALID dengan encoding baru dibuat dalam ${proofMs}ms)`);
+});
+
+test("16. buildPublicSignals == sinyal proof asli [1..12] (fallback jujur)", async () => {
+  // Sinyal fallback harus sama persis dengan sinyal dari proof Groth16 yang
+  // berhasil dibuat untuk task + keputusan yang sama — kecuali [0]
+  // (evaluationCommitment, hanya bisa dihitung circuit; platform melewatinya).
+  const task = baseTask({ task_id: "gk_test_valid_proof", input: { max_transfer: "2000" } });
+  const generated = await generateDecisionProof(task, "APPROVE", 60_000);
+  const fallback = buildPublicSignals(task, "APPROVE");
+  assert.equal(fallback.length, 13);
+  assert.equal(fallback[0], "0", "index 0 placeholder — platform melewati evaluationCommitment");
+  for (let i = 1; i < 13; i++) {
+    assert.equal(fallback[i], generated.publicSignals[i], `signal[${i}] fallback harus sama dengan proof asli`);
+  }
+  // Dan untuk REJECT: [11] harus "0", sisanya sama dengan task.
+  const rej = buildPublicSignals(task, "REJECT");
+  assert.equal(rej[11], "0");
+  assert.equal(rej[12], taskIdToField(task.task_id));
+  assert.equal(rej[1], vkHashToField(task.input.registered_vk));
 });
