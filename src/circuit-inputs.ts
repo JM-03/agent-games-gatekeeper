@@ -60,8 +60,13 @@
  * KONSEKUENSI SKOR: encoding yang SALAH membuat proof ditolak platform ->
  * penalti -2 yang SAMA dengan tidak mengirim proof. Encoding yang BENAR ->
  * proof valid, tidak ada -2, dan membuka reliability bonus +0..+5.
- * Kegagalan proof TIDAK PERNAH menggagalkan task — server selalu fallback
- * ke respons tanpa proof (lihat src/server.ts langkah 6).
+ * Kegagalan proof BISA menggagalkan task di ronde skor: respons tanpa proof
+ * untuk PROOF_REUSED di Ronde 03 (task_R03_aec58a03, 15 Nov 2026) ditolak
+ * platform (redelivery 2x lalu TIMEOUT) meski keputusan REJECT-nya benar.
+ * Karena itu fallback sekarang melampirkan sinyal publik yang jujur +
+ * proof:null (lihat buildPublicSignals + src/server.ts langkah 6) — proof
+ * REJECT memang tidak mungkin dibuat untuk replay: circuit memaksa
+ * decision=1 (assert GatekeeperEvaluation_79:102).
  */
 
 import { keccak256 } from "viem";
@@ -117,13 +122,50 @@ export function addressToField(addressHex: string): string {
 }
 
 /**
+ * Sinyal publik (13) untuk suatu keputusan — dipakai sebagai FALLBACK saat
+ * proof tidak bisa dibuat (khususnya PROOF_REUSED: circuit memaksa
+ * decision=1 karena semua cek on-chain lolos, jadi proof REJECT tidak
+ * mungkin dibuat — assert GatekeeperEvaluation_79:102).
+ *
+ * [1..12] adalah encoding jujur dari input task + keputusan (sama persis
+ * dengan yang dihasilkan buildCircuitInputs, hanya diurutkan sesuai layout
+ * public signals). [0] adalah evaluationCommitment — hash yang dihitung
+ * circuit dari input + salt, TIDAK bisa dihitung tanpa proof yang berhasil;
+ * platform melewati index 0 (lihat catatan di atas), jadi diisi "0" sebagai
+ * placeholder eksplisit. proof yang dilampirkan bersama sinyal ini adalah
+ * null (jujur: tidak ada proof) — platform tetap bisa membaca keputusan +
+ * sinyalnya, dan untuk replay memang tidak ada proof yang bisa diserahkan.
+ */
+export function buildPublicSignals(
+  task: GatekeeperTask,
+  decision: "APPROVE" | "REJECT"
+): string[] {
+  const w = buildCircuitInputs(task, decision);
+  return [
+    "0", // [0] evaluationCommitment — placeholder, platform melewati index 0
+    w.registeredVkHash, // [1]
+    w.proofVkHash, // [2]
+    w.minimum, // [3]
+    w.publicBalance, // [4]
+    w.expiryBlock, // [5]
+    w.currentBlock, // [6]
+    w.recipient, // [7]
+    w.conditionRecipient, // [8]
+    w.amount, // [9]
+    w.maxTransfer, // [10]
+    w.decision, // [11]
+    w.taskId, // [12]
+  ];
+}
+
+/**
  * Bangun 13 input circuit untuk snarkjs.groth16.fullProve().
  * Semua nilai dikembalikan sebagai decimal string — format yang diterima
  * witness calculator snarkjs untuk field element bn128.
  *
  * @throws Error kalau ada nilai task yang tidak bisa di-encode
  *         (mis. vk bukan 32 byte). Pemanggil HARUS menangkap dan fallback
- *         ke respons tanpa proof.
+ *         ke sinyal publik (buildPublicSignals) + proof:null.
  */
 export function buildCircuitInputs(
   task: GatekeeperTask,

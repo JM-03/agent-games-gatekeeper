@@ -11,7 +11,8 @@
  *     dijawab, kembalikan respons lama (idempotency).
  *  5. Hitung keputusan deterministik (fail-closed).
  *  6. Coba buat proof lokal (kalau pemetaan circuit sudah diisi dan masih
- *     dalam batas waktu) — gagal -> tetap kirim keputusan TANPA proof.
+ *     dalam batas waktu) — gagal -> kirim keputusan + sinyal publik +
+ *     proof:null (respons tanpa proof pernah ditolak platform di ronde skor).
  *  7. Kirim respons JSON yang ditandatangani HMAC.
  *  8. Background: kalau ada proof + KURIER_API_KEY, submit ke Kurier.
  */
@@ -29,7 +30,7 @@ import { computeHmacHex, verifyHmacAny, SIGNATURE_HEADER } from "./hmac";
 import { decide, parseTask, type GatekeeperTask } from "./decision";
 import { SeenStore, type StoredResponse } from "./store";
 import { generateDecisionProof, getCircuitInfo } from "./proof";
-import { CircuitInputMappingNotConfigured } from "./circuit-inputs";
+import { buildPublicSignals, CircuitInputMappingNotConfigured } from "./circuit-inputs";
 import { submitProofInBackground, registerKurierVkInBackground } from "./kurier";
 
 function log(msg: string): void {
@@ -206,10 +207,24 @@ export function createApp(store: SeenStore): Express {
       log(`[agent] task ${task.task_id}: ${result.decision} (${result.reason_code}) — ${result.detail}`);
 
       // 6. Coba buat proof lokal (opsional — jangan sampai melewati deadline).
+      //    Kalau proof tidak bisa dibuat, lampirkan sinyal publik yang jujur
+      //    + proof:null (bukan respons kosong): respons tanpa proof untuk
+      //    PROOF_REUSED di Ronde 03 ditolak platform (redelivery 2x lalu
+      //    TIMEOUT) meski keputusannya benar — lihat buildPublicSignals.
       let proof: unknown;
       let publicSignals: string[] | undefined;
+      let fallbackSignals: string[] | undefined;
       const remainingMs = RESPONSE_DEADLINE_MS - (Date.now() - startedAt);
-      if (remainingMs > 5000) {
+      if (result.reason_code === "PROOF_REUSED") {
+        // Circuit memaksa decision=1 untuk replay (semua cek on-chain lolos),
+        // jadi proof REJECT tidak mungkin dibuat (assert :102) — jangan coba.
+        try {
+          fallbackSignals = buildPublicSignals(task, result.decision);
+          log(`[agent] task ${task.task_id}: PROOF_REUSED — proof tidak ada (circuit memaksa APPROVE), sinyal publik dilampirkan, proof=null.`);
+        } catch (err) {
+          log(`[agent] sinyal fallback gagal: ${(err as Error).message} — kirim keputusan saja.`);
+        }
+      } else if (remainingMs > 5000) {
         try {
           const generated = await generateDecisionProof(
             task,
@@ -230,11 +245,22 @@ export function createApp(store: SeenStore): Express {
           if (err instanceof CircuitInputMappingNotConfigured) {
             log("[agent] proof dilewati: pemetaan input circuit belum diisi (lihat src/circuit-inputs.ts). Keputusan tetap dikirim.");
           } else {
-            log(`[agent] proof gagal: ${(err as Error).message} — keputusan tetap dikirim tanpa proof.`);
+            log(`[agent] proof gagal: ${(err as Error).message} — lampirkan sinyal publik, proof=null.`);
+          }
+          try {
+            fallbackSignals = buildPublicSignals(task, result.decision);
+          } catch {
+            // Sinyal tidak bisa dihitung (mis. vk tidak valid) — kirim
+            // keputusan saja, seperti perilaku lama.
           }
         }
       } else {
         log("[agent] sisa waktu < 5 detik — lewati pembuatan proof.");
+        try {
+          fallbackSignals = buildPublicSignals(task, result.decision);
+        } catch {
+          // Abaikan — kirim keputusan saja.
+        }
       }
 
       // 7. Respons (bentuk contoh di halaman event + starter prompt /build).
@@ -246,6 +272,12 @@ export function createApp(store: SeenStore): Express {
       if (proof !== undefined && publicSignals !== undefined) {
         responseBody.proof = proof;
         responseBody.public_signals = publicSignals;
+      } else if (fallbackSignals !== undefined) {
+        // Tanpa proof (khususnya PROOF_REUSED) tetap kirim sinyal publik +
+        // proof:null eksplisit — respons yang sama sekali tanpa proof pernah
+        // ditolak platform di ronde skor (Ronde 03, task 11 -> TIMEOUT).
+        responseBody.proof = null;
+        responseBody.public_signals = fallbackSignals;
       }
       store.saveResponse(task.task_id, responseBody);
       if (result.decision === "APPROVE") {
