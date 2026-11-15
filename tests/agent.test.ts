@@ -371,14 +371,14 @@ test("13. Encoding BARU: vk BigInt % P, taskId keccak256 % P (golden values)", a
     vkHashToField("0x7d3a00000000000000000000000000000000000000000000000000000000f291"),
     "12865097458986894393288539788301931603300749965206523872066043227887187849871"
   );
-  // taskId: keccak256(UTF-8) % P.
+  // taskId: UUID tail (128-bit) bila ada, fallback keccak256(UTF-8) % P.
   assert.equal(
     taskIdToField("gk_test_001"),
     "12285206862557242059294343006181173650373945713092228825753519331833957760831"
   );
   assert.equal(
     taskIdToField("practice_9e6ef3da-ead8-4ccd-b792-51dfcd7cf5cf"),
-    "6045810861643639752822587413525375509902079055848561636576741642069158778557"
+    "210594121958409637393372948959189595599"
   );
   // Reduksi benar-benar terjadi untuk nilai > P (0xff..ff 32 byte).
   assert.equal(
